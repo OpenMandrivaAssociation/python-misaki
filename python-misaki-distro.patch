@@ -1,0 +1,152 @@
+diff -Naur pristine/misaki/misaki/en.py src/misaki-9cda9268309160120fffee216280a9ca83ac4644/misaki/en.py
+--- a/misaki/en.py
++++ b/misaki/en.py
+@@ -8,10 +8,7 @@
+ import json
+ import numpy as np
+ import re
+-import spacy
+ import unicodedata
+-from transformers import BartForConditionalGeneration
+-import torch
+ 
+ def merge_tokens(tokens: List[MToken], unk: Optional[str] = None) -> MToken:
+     stress = {tk._.stress for tk in tokens if tk._.stress is not None}
+@@ -495,8 +492,32 @@
+         #         return apply_stress(self.append_currency(ps, tk._.currency), tk._.stress), rating
+         return None, None
+ 
++# Default argument: build the network fallback. An explicit None means
++# "no fallback" and must not download a model.
++_NETWORK_FALLBACK = object()
++
++_PLAIN_TOKEN = re.compile(r"\s+|[A-Za-z]+(?:['’][A-Za-z]+)?|\d+(?:[.,]\d+)*|[^\s]")
++
++def _tokenize_plain(text: str) -> List[MToken]:
++    tokens: List[MToken] = []
++    for piece in _PLAIN_TOKEN.findall(text):
++        if piece.isspace():
++            if tokens:
++                tokens[-1].whitespace += piece
++            continue
++        tag = piece if len(piece) == 1 and piece in PUNCT_TAGS else ''
++        tokens.append(MToken(
++            text=piece,
++            tag=tag,
++            whitespace='',
++            _=MToken.Underscore(is_head=True, num_flags='', prespace=False),
++        ))
++    return tokens
++
+ class FallbackNetwork:
+     def __init__(self, british, local_files_only=None):
++        import torch
++        from transformers import BartForConditionalGeneration
+         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+ 
+         # Respect offline env vars if not explicitly set
+@@ -521,6 +542,7 @@
+         return "".join([self.token_to_phoneme.get(t, '') for t in tokens if t > 3])
+ 
+     def __call__(self, input_token):
++        import torch
+         input_ids = torch.tensor([self.graphemes_to_tokens(input_token.text)], device = self.device)
+ 
+         with torch.no_grad():
+@@ -529,17 +551,25 @@
+         return (output_text, 1)
+ 
+ class G2P:
+-    def __init__(self, version=None, trf=False, british=False, fallback=None, unk='❓', local_files_only=None):
++    def __init__(self, version=None, trf=False, british=False, fallback=_NETWORK_FALLBACK, unk='❓', local_files_only=None):
+         self.version = version
+         self.british = british
++        self.lexicon = Lexicon(british)
++        if fallback is _NETWORK_FALLBACK:
++            self.fallback = FallbackNetwork(british, local_files_only=local_files_only)
++        else:
++            self.fallback = fallback
++        self.unk = unk
++        self.nlp = None
++        try:
++            import spacy
++        except ImportError:
++            return
+         name = f"en_core_web_{'trf' if trf else 'sm'}"
+         if not spacy.util.is_package(name):
+-            spacy.cli.download(name)
++            return
+         components = ['transformer' if trf else 'tok2vec', 'tagger']
+         self.nlp = spacy.load(name, enable=components)
+-        self.lexicon = Lexicon(british)
+-        self.fallback = fallback if fallback else FallbackNetwork(british, local_files_only=local_files_only)
+-        self.unk = unk
+ 
+     @staticmethod
+     def preprocess(text):
+@@ -575,6 +605,9 @@
+         return result, tokens, features
+ 
+     def tokenize(self, text: str, tokens, features) -> List[MToken]:
++        if self.nlp is None:
++            return _tokenize_plain(text)
++        import spacy
+         doc = self.nlp(text)
+         # print(doc._.trf_data.all_outputs[0].data.shape, doc._.trf_data.all_outputs[0].lengths)
+         mutable_tokens = [MToken(
+diff -Naur pristine/misaki/misaki/espeak.py src/misaki-9cda9268309160120fffee216280a9ca83ac4644/misaki/espeak.py
+--- a/misaki/espeak.py
++++ b/misaki/espeak.py
+@@ -1,13 +1,9 @@
+-from phonemizer.backend.espeak.wrapper import EspeakWrapper
+ from typing import Tuple
+-import espeakng_loader
+ import phonemizer
+ import re
+ 
+-# Set espeak-ng library path and espeak-ng-data
+-EspeakWrapper.set_library(espeakng_loader.get_library_path())
+-# Change data_path as needed when editing espeak-ng phonemes
+-EspeakWrapper.set_data_path(espeakng_loader.get_data_path())
++# phonemizer loads the system libespeak-ng itself. A bundled copy would
++# be a prebuilt library and the wrong path on a noarch package.
+ 
+ # EspeakFallback is used as a last resort for English
+ class EspeakFallback:
+diff -Naur pristine/misaki/pyproject.toml src/misaki-9cda9268309160120fffee216280a9ca83ac4644/pyproject.toml
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -15,21 +15,20 @@
+     "License :: OSI Approved :: Apache Software License",
+     "Operating System :: OS Independent",
+ ]
+-requires-python = ">=3.8, <3.14"
++requires-python = ">=3.8"
+ dependencies = [
+     "addict",
+-    "pip>=25.0.1", 
+-    # ^ Spacy needs pip within Python, uv lacks pip by default
++    "numpy",
++    "num2words",
++    "phonemizer>=3.4",
+     "regex",
+ ]
+ 
+ [project.optional-dependencies]
+-en = ["num2words", "spacy<4", "spacy-curated-transformers", "phonemizer-fork", "espeakng-loader", "torch", "transformers"]
+ ja = ["fugashi", "jaconv", "mojimoji", "unidic", "pyopenjtalk"]
+ ko = ["jamo", "nltk"]
+ zh = ["jieba", "ordered-set", "pypinyin", "cn2an", "pypinyin-dict"]
+ vi = ["num2words", "spacy", "spacy-curated-transformers", "underthesea"]
+-de = ["phonemizer-fork", "espeakng-loader"]
+ he = ["mishkal-hebrew>=0.3.2; python_version < '3.12'"]
+ 
+ [dependency-groups]
+@@ -45,3 +44,7 @@
+ [build-system]
+ requires = ["hatchling"]
+ build-backend = "hatchling.build"
++
++[tool.hatch.build.targets.wheel]
++only-include = ["misaki"]
++only-packages = true
